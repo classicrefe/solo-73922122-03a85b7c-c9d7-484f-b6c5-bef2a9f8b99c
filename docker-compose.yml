@@ -1,0 +1,22 @@
+services:
+  sql-sandbox:
+    build: .
+    image: sql-sandbox:latest
+    container_name: sql-sandbox
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+    # Security hardening: no extra privileges, read-only root FS (the service
+    # only uses memory), no new privileges escalation.
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    mem_limit: 512m
+    cpus: "2.0"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=3).status==200 else 1)"]
+      interval: 10s
+      timeout: 3s
+      retries: 3

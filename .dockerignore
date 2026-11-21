@@ -1,0 +1,9 @@
+.venv
+.pylibs
+__pycache__
+*.pyc
+tests
+.git
+.gitignore
+*.csv
+!sample_data/*.csv

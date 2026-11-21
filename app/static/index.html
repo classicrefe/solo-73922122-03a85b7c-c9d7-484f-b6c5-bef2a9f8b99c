@@ -1,0 +1,289 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>观测数据 SQL 清洗沙箱</title>
+<style>
+  :root { --bg:#0f172a; --panel:#1e293b; --line:#334155; --fg:#e2e8f0;
+          --muted:#94a3b8; --accent:#38bdf8; --ok:#22c55e; --warn:#f59e0b;
+          --err:#ef4444; --off:#64748b; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family:"PingFang SC","Microsoft YaHei",system-ui,sans-serif;
+         background:var(--bg); color:var(--fg); line-height:1.55; }
+  header { padding:20px 28px; border-bottom:1px solid var(--line);
+           background:linear-gradient(120deg,#0f172a,#1e3a5f); }
+  header h1 { margin:0 0 4px; font-size:22px; }
+  header p { margin:0; color:var(--muted); font-size:13px; }
+  main { max-width:1080px; margin:0 auto; padding:24px 20px 60px;
+         display:grid; gap:18px; }
+  .card { background:var(--panel); border:1px solid var(--line);
+          border-radius:12px; padding:18px 20px; }
+  .card h2 { margin:0 0 12px; font-size:16px; display:flex; align-items:center; gap:8px; }
+  .card h2 .tag { font-weight:400; font-size:12px; color:var(--muted); }
+  label { display:block; font-size:13px; color:var(--muted); margin:10px 0 4px; }
+  input[type=file], select, textarea, button, input[type=text] {
+    width:100%; background:#0b1220; color:var(--fg); border:1px solid var(--line);
+    border-radius:8px; padding:10px 12px; font-size:14px; font-family:inherit; }
+  textarea { min-height:150px; font-family:ui-monospace,Menlo,Consolas,monospace; }
+  button { cursor:pointer; font-weight:600; transition:filter .15s; width:auto;
+           padding:9px 18px; background:var(--accent); color:#082f49; border:none; }
+  button:hover:not(:disabled) { filter:brightness(1.1); }
+  button:disabled { opacity:.45; cursor:not-allowed; }
+  button.ghost { background:transparent; color:var(--fg); border:1px solid var(--line); }
+  button.danger { background:var(--err); color:#fff; }
+  .row { display:flex; gap:12px; flex-wrap:wrap; align-items:flex-end; }
+  .row > div { flex:1 1 220px; }
+  .actions { display:flex; gap:10px; margin-top:14px; flex-wrap:wrap; }
+  .msg { margin-top:10px; font-size:13px; border-radius:8px; padding:9px 12px;
+         display:none; white-space:pre-wrap; word-break:break-all; }
+  .msg.show { display:block; }
+  .msg.ok { background:rgba(34,197,94,.12); border:1px solid var(--ok); }
+  .msg.err { background:rgba(239,68,68,.12); border:1px solid var(--err); }
+  .msg.info { background:rgba(56,189,248,.10); border:1px solid var(--accent); }
+  table { width:100%; border-collapse:collapse; font-size:13px; margin-top:8px; }
+  th,td { text-align:left; padding:8px 10px; border-bottom:1px solid var(--line); }
+  th { color:var(--muted); font-weight:600; }
+  .pill { display:inline-block; padding:2px 10px; border-radius:999px;
+          font-size:12px; font-weight:600; }
+  .pill.running,.pill.pending { background:rgba(56,189,248,.18); color:var(--accent); }
+  .pill.succeeded { background:rgba(34,197,94,.18); color:var(--ok); }
+  .pill.failed { background:rgba(239,68,68,.18); color:var(--err); }
+  .pill.cancelled { background:rgba(245,158,11,.18); color:var(--warn); }
+  .limits { font-size:12px; color:var(--muted); display:grid; gap:4px;
+            grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); margin-top:8px; }
+  .limits b { color:var(--fg); }
+  .examples { font-size:12px; color:var(--muted); margin-top:8px; }
+  .examples code { color:var(--accent); cursor:pointer; }
+  a.dl { color:var(--accent); text-decoration:none; font-weight:600; font-size:13px; }
+  a.dl:hover { text-decoration:underline; }
+  .slotbar { display:flex; gap:8px; align-items:center; font-size:13px; }
+  .slot { width:14px; height:14px; border-radius:4px; border:1px solid var(--line);
+          background:#0b1220; }
+  .slot.busy { background:var(--accent); border-color:var(--accent); }
+  .mini { padding:5px 12px; font-size:12px; }
+  .err-text { color:#fca5a5; font-size:12px; margin-top:6px; word-break:break-all; }
+</style>
+</head>
+<body>
+<header>
+  <h1>观测数据 SQL 清洗沙箱 <span style="font-size:12px;color:var(--muted)">FastAPI · DuckDB · 进程隔离</span></h1>
+  <p>外协清洗 SQL 试跑环境：每轮仅可见所选站点数据，只读 SELECT/WITH，独立沙箱执行。</p>
+</header>
+<main>
+  <section class="card">
+    <h2>① 上传观测 CSV <span class="tag">上限 1 MiB · 列：站号 / UTC时刻 / 温度</span></h2>
+    <div class="row">
+      <div>
+        <input type="file" id="file" accept=".csv,text/csv" />
+      </div>
+      <div style="flex:0 0 auto">
+        <button id="uploadBtn">上传</button>
+      </div>
+    </div>
+    <div id="uploadMsg" class="msg"></div>
+    <div class="limits">
+      <span>并行名额：<b id="slotText">0 / 2</b></span>
+      <span>单轮超时：<b>5 秒（硬终止）</b></span>
+      <span>结果上限：<b>8 MiB（超限整轮失败）</b></span>
+      <span>隔离：<b>每轮独立子进程 + 独立内存库</b></span>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>② 选择站点并提交 SQL <span class="tag">每轮输入固定为该站点全部观测</span></h2>
+    <div class="row">
+      <div>
+        <label for="station">站点</label>
+        <select id="station" disabled><option>请先上传 CSV</option></select>
+      </div>
+    </div>
+    <label for="sql" style="margin-top:12px">清洗 SQL（仅允许 SELECT / WITH；可用筛选、JOIN、聚合、CTE）</label>
+    <textarea id="sql" placeholder="SELECT ts_utc, temperature_c&#10;FROM observations&#10;WHERE temperature_c > 0&#10;ORDER BY ts_utc"></textarea>
+    <div class="examples">
+      点击载入示例：
+      <code data-sql="SELECT ts_utc, temperature_c FROM observations ORDER BY ts_utc">筛选/排序</code> ·
+      <code data-sql="WITH ranked AS (&#10;  SELECT ts_utc, temperature_c,&#10;         ROW_NUMBER() OVER (ORDER BY temperature_c DESC) AS rn&#10;  FROM observations&#10;)&#10;SELECT * FROM ranked WHERE rn &lt;= 5">CTE + 窗口</code> ·
+      <code data-sql="SELECT station_id, COUNT(*) AS n,&#10;       ROUND(AVG(temperature_c), 2) AS avg_t,&#10;       ROUND(MIN(temperature_c), 2) AS min_t,&#10;       ROUND(MAX(temperature_c), 2) AS max_t&#10;FROM observations&#10;GROUP BY station_id">聚合</code> ·
+      <code data-sql="WITH a AS (SELECT ts_utc, temperature_c FROM observations),&#10;     b AS (SELECT ts_utc, temperature_c AS prev_t FROM observations)&#10;SELECT a.ts_utc, a.temperature_c, b.prev_t&#10;FROM a JOIN b ON a.ts_utc = b.ts_utc">WITH 自连接</code>
+    </div>
+    <div class="actions">
+      <button id="submitBtn" disabled>提交 SQL（创建一轮）</button>
+      <button id="refreshBtn" class="ghost">刷新状态</button>
+    </div>
+    <div id="submitMsg" class="msg"></div>
+  </section>
+
+  <section class="card">
+    <h2>③ 轮次状态 <span class="tag">可查询、可取消；成功后可下载结果 CSV</span></h2>
+    <div class="slotbar" style="margin-bottom:10px">
+      名额
+      <span class="slot" id="slot0"></span><span class="slot" id="slot1"></span>
+      <span id="slotHint" style="color:var(--muted)"></span>
+      <button class="ghost mini" id="autoBtn" style="margin-left:auto">自动刷新：开</button>
+    </div>
+    <table>
+      <thead><tr>
+        <th>轮次</th><th>站点</th><th>状态</th><th>行数/大小</th>
+        <th>耗时</th><th>说明 / 错误</th><th>操作</th>
+      </tr></thead>
+      <tbody id="roundsBody"><tr><td colspan="7" style="color:var(--muted)">暂无轮次</td></tr></tbody>
+    </table>
+  </section>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let autoRefresh = true;
+
+function showMsg(el, text, kind) {
+  el.textContent = text;
+  el.className = "msg show " + kind;
+}
+function clearMsg(el) { el.className = "msg"; el.textContent = ""; }
+
+async function api(path, opts) {
+  const resp = await fetch(path, opts);
+  let body = null;
+  try { body = await resp.json(); } catch (e) { /* non-json */ }
+  if (!resp.ok) {
+    const detail = body && body.detail ? body.detail : ("HTTP " + resp.status);
+    const err = new Error(detail);
+    err.status = resp.status;
+    throw err;
+  }
+  return body;
+}
+
+$("uploadBtn").onclick = async () => {
+  const f = $("file").files[0];
+  if (!f) { showMsg($("uploadMsg"), "请先选择 CSV 文件", "err"); return; }
+  if (f.size > 1024 * 1024) { showMsg($("uploadMsg"), "文件超过 1 MiB 上限", "err"); return; }
+  const fd = new FormData();
+  fd.append("file", f);
+  $("uploadBtn").disabled = true;
+  try {
+    const data = await api("/api/upload", { method: "POST", body: fd });
+    const sel = $("station");
+    sel.innerHTML = "";
+    data.stations.forEach((s) => {
+      const opt = document.createElement("option");
+      opt.value = s;
+      opt.textContent = s + "（" + data.station_counts[s] + " 行）";
+      sel.appendChild(opt);
+    });
+    sel.disabled = false;
+    $("submitBtn").disabled = false;
+    showMsg($("uploadMsg"),
+      "上传成功：" + data.filename + "，共 " + data.total_rows + " 行，" +
+      data.stations.length + " 个站点", "ok");
+  } catch (e) {
+    showMsg($("uploadMsg"), "上传失败：" + e.message, "err");
+  } finally {
+    $("uploadBtn").disabled = false;
+  }
+};
+
+document.querySelectorAll(".examples code").forEach((el) => {
+  el.onclick = () => { $("sql").value = el.dataset.sql; };
+});
+
+$("submitBtn").onclick = async () => {
+  const sql = $("sql").value.trim();
+  if (!sql) { showMsg($("submitMsg"), "SQL 不能为空", "err"); return; }
+  $("submitBtn").disabled = true;
+  try {
+    const data = await api("/api/rounds", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ station_id: $("station").value, sql })
+    });
+    showMsg($("submitMsg"), "已创建轮次 " + data.round_id.slice(0, 8) +
+      "，状态 " + data.state, "info");
+    refreshRounds();
+  } catch (e) {
+    const kind = e.status === 503 ? "err" : "err";
+    showMsg($("submitMsg"),
+      (e.status === 503 ? "名额已满被拒绝：" : "提交失败：") + e.message, kind);
+  } finally {
+    $("submitBtn").disabled = false;
+  }
+};
+
+$("refreshBtn").onclick = () => refreshRounds();
+$("autoBtn").onclick = () => {
+  autoRefresh = !autoRefresh;
+  $("autoBtn").textContent = "自动刷新：" + (autoRefresh ? "开" : "关");
+};
+
+async function cancelRound(id) {
+  try {
+    const data = await api("/api/rounds/" + id + "/cancel", { method: "POST" });
+    showMsg($("submitMsg"), "取消受理：" + data.message, "info");
+  } catch (e) {
+    showMsg($("submitMsg"), "取消失败：" + e.message, "err");
+  }
+  refreshRounds();
+}
+
+async function refreshRounds() {
+  let data;
+  try {
+    data = await api("/api/rounds");
+  } catch (e) { return; }
+  const body = $("roundsBody");
+  const active = data.active;
+  $("slotText").textContent = active + " / 2";
+  $("slot0").className = "slot" + (active >= 1 ? " busy" : "");
+  $("slot1").className = "slot" + (active >= 2 ? " busy" : "");
+  $("slotHint").textContent = active >= 2 ? "（满额，新提交将被拒绝）" : "";
+
+  if (!data.rounds.length) {
+    body.innerHTML = '<tr><td colspan="7" style="color:var(--muted)">暂无轮次</td></tr>';
+    return;
+  }
+  body.innerHTML = "";
+  [...data.rounds].reverse().forEach((r) => {
+    const tr = document.createElement("tr");
+    const running = r.state === "running" || r.state === "pending";
+    const size = r.state === "succeeded"
+      ? (r.row_count + " 行 / " + (r.result_bytes / 1024).toFixed(1) + " KiB")
+      : "—";
+    const note = r.error || (r.cancel_requested && running ? "取消请求已受理，等待进程退出…" : "");
+    tr.innerHTML =
+      "<td>" + r.round_id.slice(0, 8) + "</td>" +
+      "<td>" + escapeHtml(r.station_id) + "</td>" +
+      '<td><span class="pill ' + r.state + '">' + r.state +
+      (r.cancel_requested && running ? "（取消中）" : "") + "</span></td>" +
+      "<td>" + size + "</td>" +
+      "<td>" + r.elapsed_ms + " ms</td>" +
+      '<td class="err-text">' + escapeHtml(note) + "</td>" +
+      "<td></td>";
+    const actionTd = tr.lastElementChild;
+    if (running) {
+      const btn = document.createElement("button");
+      btn.className = "danger mini";
+      btn.textContent = "取消";
+      btn.onclick = () => cancelRound(r.round_id);
+      actionTd.appendChild(btn);
+    } else if (r.state === "succeeded") {
+      const a = document.createElement("a");
+      a.className = "dl";
+      a.href = r.download_url;
+      a.textContent = "下载结果 CSV";
+      actionTd.appendChild(a);
+    }
+    body.appendChild(tr);
+  });
+}
+
+function escapeHtml(s) {
+  return String(s ?? "").replace(/[&<>"']/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+setInterval(() => { if (autoRefresh) refreshRounds(); }, 700);
+refreshRounds();
+</script>
+</body>
+</html>
