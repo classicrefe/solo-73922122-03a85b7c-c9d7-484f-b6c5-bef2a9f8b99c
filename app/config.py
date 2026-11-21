@@ -6,6 +6,9 @@ import os
 # Upload limits
 MAX_UPLOAD_BYTES = 1 * 1024 * 1024  # 1 MiB CSV
 MAX_CSV_ROWS = 200_000
+# Worker threads that parse/validate/split uploads off the event loop, so
+# round polling and result downloads stay responsive during long validations.
+MAX_UPLOAD_WORKERS = 4
 
 # Concurrency: at most two rounds executing at the same time.
 MAX_CONCURRENT_ROUNDS = 2

@@ -1,6 +1,7 @@
 """FastAPI application: CSV upload, station-scoped SQL rounds and downloads."""
 from __future__ import annotations
 
+import asyncio
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -9,10 +10,7 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel
 
 from .config import MAX_CONCURRENT_ROUNDS, MAX_UPLOAD_BYTES, QUERY_TIMEOUT_SECONDS
-from .csv_io import CsvError, parse_observations_csv
 from .registry import (
-    CANCELLED,
-    FAILED,
     SUCCEEDED,
     RoundNotFound,
     RoundRegistry,
@@ -20,17 +18,24 @@ from .registry import (
 )
 from .sql_guard import SqlRejected, validate_sql
 from .store import DataStore
+from .upload_pipeline import REJECTED, UploadPipeline
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 registry = RoundRegistry()
 store = DataStore()
+# CSV validation and per-station splitting run on this pipeline's worker
+# threads, so a slow upload can never block round queries or downloads.
+upload_pipeline = UploadPipeline(store)
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    yield
-    registry.shutdown()
+    try:
+        yield
+    finally:
+        registry.shutdown()
+        upload_pipeline.shutdown()
 
 
 app = FastAPI(
@@ -64,31 +69,30 @@ def health() -> dict:
         "active_rounds": registry.active_count(),
         "dataset_loaded": dataset is not None,
         "stations": dataset.stations if dataset else [],
+        "station_counts": dataset.station_counts if dataset else {},
+        "dataset_filename": dataset.filename if dataset else None,
+        "dataset_sequence": dataset.sequence if dataset else None,
     }
 
 
 @app.post("/api/upload")
-async def upload_csv(file: UploadFile = File(...)) -> dict:
+async def upload_csv(file: UploadFile = File(...)) -> JSONResponse:
+    # Reading the multipart body is the only work done on the event loop;
+    # parsing, validation and station splitting happen on pipeline threads.
     raw = await file.read(MAX_UPLOAD_BYTES + 1)
     if len(raw) > MAX_UPLOAD_BYTES:
         raise HTTPException(
             status_code=413,
             detail=f"文件超过 1 MiB 上限（{len(raw)} bytes）",
         )
-    try:
-        parsed = parse_observations_csv(raw)
-    except CsvError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    dataset = store.replace(parsed, file.filename or "upload.csv")
-    return {
-        "filename": dataset.filename,
-        "total_rows": dataset.total_rows,
-        "stations": dataset.stations,
-        "station_counts": {
-            station: len(cols["station_id"]) for station, cols in dataset.by_station.items()
-        },
-        "message": "上传成功，请选择站点并提交 SQL",
-    }
+    filename = file.filename or "upload.csv"
+    future = upload_pipeline.submit(raw, filename)
+    # Await the worker without blocking the loop: round polling, round
+    # creation and result downloads keep being served meanwhile.
+    result = await asyncio.wrap_future(future)
+    if result.outcome == REJECTED:
+        raise HTTPException(status_code=400, detail=result.public_dict())
+    return JSONResponse(status_code=200, content=result.public_dict())
 
 
 @app.post("/api/rounds")

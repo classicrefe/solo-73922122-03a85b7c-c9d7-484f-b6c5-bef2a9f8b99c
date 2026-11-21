@@ -67,12 +67,12 @@
 </head>
 <body>
 <header>
-  <h1>观测数据 SQL 清洗沙箱 <span style="font-size:12px;color:var(--muted)">FastAPI · DuckDB · 进程隔离</span></h1>
+  <h1>观测数据 SQL 清洗沙箱 <span style="font-size:12px;color:var(--muted)">FastAPI · DuckDB · 线程级隔离</span></h1>
   <p>外协清洗 SQL 试跑环境：每轮仅可见所选站点数据，只读 SELECT/WITH，独立沙箱执行。</p>
 </header>
 <main>
   <section class="card">
-    <h2>① 上传观测 CSV <span class="tag">上限 1 MiB · 列：站号 / UTC时刻 / 温度</span></h2>
+    <h2>① 上传观测 CSV <span class="tag">上限 1 MiB · 列：站号 / UTC时刻 / 温度 · 校验不阻塞轮次查询/下载</span></h2>
     <div class="row">
       <div>
         <input type="file" id="file" accept=".csv,text/csv" />
@@ -83,10 +83,15 @@
     </div>
     <div id="uploadMsg" class="msg"></div>
     <div class="limits">
+      <span>当前批次：<b id="batchText">未加载</b></span>
       <span>并行名额：<b id="slotText">0 / 2</b></span>
       <span>单轮超时：<b>5 秒（硬终止）</b></span>
       <span>结果上限：<b>8 MiB（超限整轮失败）</b></span>
-      <span>隔离：<b>每轮独立子进程 + 独立内存库</b></span>
+      <span>隔离：<b>每轮独立线程 + 独立内存库</b></span>
+    </div>
+    <div class="examples" style="margin-top:6px">
+      换批规则：按文件进入校验的先后编号，仅校验通过且比当前批次更新的文件才会换入；
+      校验期间轮次查询与结果下载照常响应；已受理的 SQL 继续使用其原始输入。
     </div>
   </section>
 
@@ -148,11 +153,37 @@ async function api(path, opts) {
   try { body = await resp.json(); } catch (e) { /* non-json */ }
   if (!resp.ok) {
     const detail = body && body.detail ? body.detail : ("HTTP " + resp.status);
-    const err = new Error(detail);
+    const err = new Error(typeof detail === "string" ? detail : (detail.message || "HTTP " + resp.status));
     err.status = resp.status;
+    err.body = body;
     throw err;
   }
   return body;
+}
+
+function renderStations(data) {
+  const sel = $("station");
+  sel.innerHTML = "";
+  (data.stations || []).forEach((s) => {
+    const opt = document.createElement("option");
+    const n = data.station_counts ? data.station_counts[s] : "";
+    opt.value = s;
+    opt.textContent = n === "" ? s : (s + "（" + n + " 行）");
+    sel.appendChild(opt);
+  });
+  sel.disabled = !(data.stations && data.stations.length);
+  if (!sel.disabled) $("submitBtn").disabled = false;
+}
+
+function renderBatch(data) {
+  if (data && data.dataset_loaded) {
+    $("batchText").textContent =
+      "#" + data.dataset_sequence + " " + data.dataset_filename +
+      "（" + data.stations.length + " 站）";
+    renderStations(data);
+  } else {
+    $("batchText").textContent = "未加载";
+  }
 }
 
 $("uploadBtn").onclick = async () => {
@@ -164,25 +195,36 @@ $("uploadBtn").onclick = async () => {
   $("uploadBtn").disabled = true;
   try {
     const data = await api("/api/upload", { method: "POST", body: fd });
-    const sel = $("station");
-    sel.innerHTML = "";
-    data.stations.forEach((s) => {
-      const opt = document.createElement("option");
-      opt.value = s;
-      opt.textContent = s + "（" + data.station_counts[s] + " 行）";
-      sel.appendChild(opt);
-    });
-    sel.disabled = false;
-    $("submitBtn").disabled = false;
-    showMsg($("uploadMsg"),
-      "上传成功：" + data.filename + "，共 " + data.total_rows + " 行，" +
-      data.stations.length + " 个站点", "ok");
+    if (data.outcome === "swapped") {
+      renderStations(data);
+      showMsg($("uploadMsg"),
+        data.message + "\n共 " + data.total_rows + " 行，" + data.stations.length + " 个站点。", "ok");
+    } else {
+      // outcome === "stale": a newer batch was published while this file
+      // was being validated; keep the UI on the current batch.
+      const health = await api("/api/health");
+      renderBatch(health);
+      showMsg($("uploadMsg"), data.message, "info");
+    }
   } catch (e) {
-    showMsg($("uploadMsg"), "上传失败：" + e.message, "err");
+    // Validation failures come back as 400 with a structured detail.
+    const detail = e.body && e.body.detail && typeof e.body.detail === "object"
+      ? e.body.detail : null;
+    if (e.status === 400 && detail) {
+      showMsg($("uploadMsg"),
+        detail.message + (detail.error ? ("\n原因：" + detail.error) : ""), "err");
+    } else {
+      showMsg($("uploadMsg"), "上传失败：" + e.message, "err");
+    }
   } finally {
     $("uploadBtn").disabled = false;
   }
 };
+
+// Keep the batch indicator in sync (e.g. after another tab swaps a batch).
+(async function syncHealth() {
+  try { renderBatch(await api("/api/health")); } catch (e) { /* ignore */ }
+})();
 
 document.querySelectorAll(".examples code").forEach((el) => {
   el.onclick = () => { $("sql").value = el.dataset.sql; };

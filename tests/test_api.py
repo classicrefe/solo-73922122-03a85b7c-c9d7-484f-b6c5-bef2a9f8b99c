@@ -1,13 +1,14 @@
 """End-to-end API tests covering concurrency, timeout, cancel and isolation."""
 from __future__ import annotations
 
+import threading
 import time
 from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 
-from app.main import app, registry, store
+from app.main import app, registry, store, upload_pipeline
 from app.registry import CANCELLED, FAILED, RUNNING, SUCCEEDED
 
 SAMPLE = Path(__file__).resolve().parent.parent / "sample_data" / "observations.csv"
@@ -18,11 +19,15 @@ def client():
     # Each test starts from an empty registry and no uploaded dataset.
     registry._rounds.clear()
     store._dataset = None
+    upload_pipeline.shutdown()
+    with upload_pipeline._seq_lock:
+        upload_pipeline._next_sequence = 1
     with TestClient(app) as c:
         yield c
     registry.shutdown()
     registry._rounds.clear()
     store._dataset = None
+    upload_pipeline.shutdown()
 
 
 def _upload(client):
@@ -272,3 +277,206 @@ def test_index_page_served(client):
     assert resp.status_code == 200
     assert "text/html" in resp.headers["content-type"]
     assert "观测数据 SQL 清洗沙箱" in resp.text
+
+
+# --------------------------------------------------------------------- uploads
+
+VALID_CSV = (
+    "站号,UTC时刻,温度\n"
+    "X1,2026-01-01T00:00Z,1.0\n"
+    "X1,2026-01-01T01:00Z,2.0\n"
+    "X2,2026-01-01T00:00Z,3.0\n"
+).encode()
+
+INVALID_CSV = "站号,UTC时刻,温度\nX1,t,not-a-number\n".encode()
+
+
+def test_upload_returns_swapped_outcome_with_batch_metadata(client):
+    resp = client.post(
+        "/api/upload", files={"file": ("batch.csv", VALID_CSV, "text/csv")}
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["outcome"] == "swapped"
+    assert data["sequence"] == 1
+    assert data["total_rows"] == 3
+    assert data["stations"] == ["X1", "X2"]
+    assert data["station_counts"] == {"X1": 2, "X2": 1}
+    assert "换批成功" in data["message"]
+    health = client.get("/api/health").json()
+    assert health["dataset_sequence"] == 1
+    assert health["stations"] == ["X1", "X2"]
+
+
+def test_invalid_upload_returns_400_and_keeps_current_batch(client):
+    _upload(client)
+    before = client.get("/api/health").json()
+    resp = client.post(
+        "/api/upload", files={"file": ("bad.csv", INVALID_CSV, "text/csv")}
+    )
+    assert resp.status_code == 400
+    detail = resp.json()["detail"]
+    assert detail["outcome"] == "rejected"
+    assert detail["sequence"] == 2
+    assert "校验失败" in detail["message"]
+    after = client.get("/api/health").json()
+    assert after["dataset_sequence"] == before["dataset_sequence"] == 1
+    assert after["stations"] == before["stations"]
+
+
+def test_slow_upload_validation_does_not_block_rounds_or_downloads(client, monkeypatch):
+    """The regression this change fixes: endpoints stay live during validation."""
+    import app.upload_pipeline as pipeline_mod
+
+    _upload(client)
+    # A succeeded round with a downloadable result, created before the upload.
+    rid = client.post(
+        "/api/rounds",
+        json={"station_id": "ST001", "sql": "SELECT count(*) AS n FROM observations"},
+    ).json()["round_id"]
+    _wait_terminal(client, rid)
+    assert client.get(f"/api/rounds/{rid}").json()["state"] == SUCCEEDED
+
+    real_parse = pipeline_mod.parse_observations_csv
+
+    def slow_parse(raw):
+        time.sleep(2.0)
+        return real_parse(raw)
+
+    monkeypatch.setattr(pipeline_mod, "parse_observations_csv", slow_parse)
+
+    upload_result = {}
+
+    def do_upload():
+        upload_result["resp"] = client.post(
+            "/api/upload", files={"file": ("slow.csv", VALID_CSV, "text/csv")}
+        )
+
+    th = threading.Thread(target=do_upload)
+    th.start()
+    time.sleep(0.4)  # let the request enter the (now slow) validation stage
+    try:
+        t0 = time.monotonic()
+        health = client.get("/api/health")
+        health_ms = (time.monotonic() - t0) * 1000
+        t0 = time.monotonic()
+        rounds = client.get("/api/rounds")
+        rounds_ms = (time.monotonic() - t0) * 1000
+        t0 = time.monotonic()
+        download = client.get(f"/api/rounds/{rid}/result")
+        download_ms = (time.monotonic() - t0) * 1000
+    finally:
+        th.join()
+
+    assert upload_result["resp"].status_code == 200
+    assert health.status_code == 200
+    assert rounds.status_code == 200 and rounds.json()["active"] == 0
+    assert download.status_code == 200 and b"n\n5\n" in download.content
+    # None of the short endpoints waited for the 2 s validation.
+    assert max(health_ms, rounds_ms, download_ms) < 500, (
+        health_ms, rounds_ms, download_ms
+    )
+
+
+def test_concurrent_uploads_newer_valid_wins_and_older_reported_stale(client, monkeypatch):
+    """Out-of-order completion: older file finishes after newer one -> stale."""
+    import app.upload_pipeline as pipeline_mod
+
+    real_parse = pipeline_mod.parse_observations_csv
+    block_first = threading.Event()
+    first_seen = threading.Event()
+
+    def ordered_parse(raw):
+        # The first upload (a.csv) blocks until the second one has published.
+        if not first_seen.is_set():
+            first_seen.set()
+            block_first.wait()
+        return real_parse(raw)
+
+    monkeypatch.setattr(pipeline_mod, "parse_observations_csv", ordered_parse)
+
+    outcomes = {}
+
+    def upload(name, payload, key):
+        outcomes[key] = client.post(
+            "/api/upload", files={"file": (name, payload, "text/csv")}
+        )
+
+    t1 = threading.Thread(target=upload, args=("a.csv", VALID_CSV, "older"))
+    t2 = threading.Thread(target=upload, args=("b.csv", VALID_CSV, "newer"))
+    t1.start()
+    # Make sure a.csv enters validation (and blocks) before b.csv is submitted.
+    first_seen.wait(5)
+    t2.start()
+    t2.join(timeout=10)
+    block_first.set()
+    t1.join(timeout=10)
+
+    older = outcomes["older"].json()
+    newer = outcomes["newer"].json()
+    assert newer["outcome"] == "swapped" and newer["sequence"] == 2
+    assert older["outcome"] == "stale" and older["sequence"] == 1
+    assert older["current_sequence"] == 2
+    assert "已有更新批次" in older["message"]
+    # The live batch is the newer one.
+    health = client.get("/api/health").json()
+    assert health["dataset_sequence"] == 2
+
+
+def test_newer_invalid_upload_does_not_block_older_valid_swap(client):
+    """Newer file fails validation; the earlier valid file still swaps in."""
+    # Hold upload #1 inside its worker (valid, but not finished yet) and send
+    # upload #2, which is invalid and finishes first.
+    validate1 = threading.Event()
+    release1 = threading.Event()
+    future1 = upload_pipeline.submit_controlled(
+        VALID_CSV, "a.csv", validate1, release1
+    )
+    validate1.set()  # let #1 validate; it still holds at the release barrier
+
+    bad = client.post(
+        "/api/upload", files={"file": ("bad.csv", INVALID_CSV, "text/csv")}
+    )
+    assert bad.status_code == 400
+    detail = bad.json()["detail"]
+    assert detail["outcome"] == "rejected"
+    assert detail["sequence"] == 2
+
+    release1.set()
+    older = future1.result(timeout=10)
+    assert older.outcome == "swapped"
+    assert older.sequence == 1
+
+    # The older valid file (sequence 1) is the live batch; the failed newer
+    # file (sequence 2) never replaced it.
+    health = client.get("/api/health").json()
+    assert health["dataset_sequence"] == 1
+    assert health["stations"] == ["X1", "X2"]
+
+
+def test_accepted_round_keeps_original_input_after_batch_swap(client):
+    """Rounds snapshot their station columns; later uploads cannot change them."""
+    _upload(client)
+    rid = client.post(
+        "/api/rounds",
+        json={"station_id": "ST001", "sql": "SELECT count(*) AS n FROM observations"},
+    ).json()["round_id"]
+    final = _wait_terminal(client, rid)
+    assert final["state"] == SUCCEEDED
+    first_csv = client.get(f"/api/rounds/{rid}/result").content
+
+    # Swap in a different batch (ST001 no longer exists there).
+    resp = client.post(
+        "/api/upload", files={"file": ("other.csv", VALID_CSV, "text/csv")}
+    )
+    assert resp.json()["outcome"] == "swapped"
+    assert "ST001" not in client.get("/api/health").json()["stations"]
+
+    # The old round's result is still the original input's output.
+    assert client.get(f"/api/rounds/{rid}/result").content == first_csv
+    # New rounds cannot target the vanished station.
+    refused = client.post(
+        "/api/rounds",
+        json={"station_id": "ST001", "sql": "SELECT 1"},
+    )
+    assert refused.status_code == 404
